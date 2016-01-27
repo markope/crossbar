@@ -388,7 +388,7 @@ class Dealer(object):
                     elif registration.extra.invoke == message.Register.INVOKE_RANDOM:
                         callee = registration.observers[random.randint(0, len(registration.observers) - 1)]
 
-                    elif registration.extra.invoke == message.Register.INVOKE_BALANCE:
+                    elif registration.extra.invoke == message.Register.INVOKE_LEASTBUSY:
                         busylist = [v.callee for k, v in self._invocations.items()]
                         nonbusylist = set(registration.observers) - set(busylist)
                         # choose randomly from non busy observers to balance in a low traffic scenarios as well
