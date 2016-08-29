@@ -28,144 +28,83 @@
 #
 #####################################################################################
 
-from __future__ import absolute_import
-
-import sys
 import re
 import os
-import platform
+
 from setuptools import setup, find_packages
 
-version = getattr(sys, "version_info", (0,))
 
-CPY = platform.python_implementation() == 'CPython'
-PYPY = platform.python_implementation() == 'PyPy'
+# read package description
+with open('README.rst') as f:
+    long_description = f.read()
 
-LONGSDESC = open('README.rst').read()
+# read package version
+with open('crossbar/__init__.py') as f:
+    mo = re.search(r"^__version__ = ['\"]([^'\"]*)['\"]", f.read(), re.M)
+    if mo:
+        version = mo.group(1)
+    else:
+        raise RuntimeError('could not read package version')
 
-# Get package version from crossbar/__init__.py
-#
-VERSIONFILE = "crossbar/__init__.py"
-verstrline = open(VERSIONFILE, "rt").read()
-VSRE = r"^__version__ = ['\"]([^'\"]*)['\"]"
-mo = re.search(VSRE, verstrline, re.M)
-if mo:
-    verstr = mo.group(1)
-else:
-    raise RuntimeError("Unable to find version string in {}.".format(VERSIONFILE))
+# read requirements from requirements.txt
+install_requires = []
+extras_require = {
+    'dev': [
+        'towncrier',
+        'tox',
+    ]
+}
+
+with open('requirements-in.txt') as f:
+    for line in f.read().splitlines():
+        line = line.strip()
+        if not line.startswith('#'):
+            parts = line.strip().split(';')
+            if len(parts) > 1:
+                parts[0] = parts[0].strip()
+                parts[1] = ':{}'.format(parts[1].strip())
+                if parts[1] not in extras_require:
+                    extras_require[parts[1]] = []
+                extras_require[parts[1]].append(parts[0])
+            else:
+                install_requires.append(parts)
+
+with open('requirements-dev.txt') as f:
+    for line in f.read().splitlines():
+        extras_require['dev'].append(line.strip())
 
 # enforce use of CFFI for LMDB
-if PYPY:
-    os.environ['LMDB_FORCE_CFFI'] = '1'
+os.environ['LMDB_FORCE_CFFI'] = '1'
 
-install_requires = [
-    'click>=5.1',                 # BSD license
-    'setuptools>=18.3.1',         # Python Software Foundation license
-    'zope.interface>=4.1.2',      # Zope Public license
-    'twisted>=15.5.0',            # MIT license
-    'autobahn[twisted]>=0.11.0',  # MIT license
-    'netaddr>=0.7.18',            # BSD license
-    'pytrie>=0.2',                # BSD license
-    'jinja2>=2.8',                # BSD license
-    'mistune>=0.7.1',             # BSD license
-    'pygments>=2.0.2',            # BSD license
-    'pyyaml>=3.11',               # MIT license
-    'shutilwhich>=1.1.0',         # PSF license
+# enforce use of bundled libsodium
+os.environ['SODIUM_INSTALL'] = 'bundled'
 
-    'psutil>=3.2.1',              # BSD license
-    'lmdb>=0.88',                 # OpenLDAP BSD
+# enforce use of pure Python py-ubjson (no Cython)
+os.environ['PYUBJSON_NO_EXTENSION'] = '1'
 
-    # Serializers
-    'msgpack-python>=0.4.6',      # Apache 2.0 license
-    'cbor>=0.1.24',               # Apache 2.0 license
-
-    # TLS
-    'cryptography>=0.9.3',        # Apache license
-    'pyOpenSSL>=0.15.1',          # Apache license
-    'pyasn1>=0.1.8',              # BSD license
-    'pyasn1-modules>=0.0.7',      # BSD license
-    'service_identity>=14.0.0',   # MIT license
-
-    # NaCl
-    'pynacl>=1.0.1',              # Apache license
-
-    # HTTP/REST bridge (also pulls in TLS packages!)
-    'treq>=15.1.0',               # MIT license
-]
-if sys.platform != 'win32':
-    # setproctitle does not provide wheels (https://github.com/dvarrazzo/py-setproctitle/issues/47) => disable on Windows
-    install_requires.append('setproctitle>=1.1.9')  # BSD license
-
-if sys.platform == 'win32':
-    install_requires.append('pypiwin32>=219')       # PSF license
-
-# FIXME: https://github.com/crossbario/crossbar/issues/581
-if sys.platform.startswith('linux'):
-    install_requires.append('pyinotify>=0.9.6')     # MIT license
-
-# native WebSocket/JSON acceleration - only for CPy (skip for PyPy, since it'll be _slower_ on that!)
-if CPY:
-    # wsaccel does not provide wheels (https://github.com/methane/wsaccel/issues/12) => disable on Windows
-    if sys.platform != 'win32':
-        install_requires.append('wsaccel>=0.6.2')   # Apache 2.0
-
-    # ujson is broken on Windows (https://github.com/esnme/ultrajson/issues/184)
-    if sys.platform != 'win32':
-        install_requires.append("ujson>=1.33")      # BSD license
-
-# For Crossbar.io development
-extras_require_dev = [
-    'flake8>=2.5.1',                # MIT license
-    'colorama>=0.3.3',              # BSD license
-    'mock>=1.3.0',                  # BSD license
-]
-if sys.platform != 'win32':
-    # Twisted manhole support
-    # pycrypto does not provide wheels => disable on Windows
-    extras_require_dev.append('pycrypto>=2.6.1')   # Public Domain license
-
-# Crossbar.io/PostgreSQL integration
-extras_require_postgres = [
-    'txpostgres>=1.4.0'             # MIT license
-]
-if CPY:
-    extras_require_postgres.append('psycopg2>=2.6.1')       # LGPL license
-else:
-    extras_require_postgres.append('psycopg2cffi>=2.7.2')   # LGPL license
-
-# Crossbar.io/Oracle integration
-extras_require_oracle = [
-    'cx_Oracle>=5.2',               # Python Software Foundation license
-]
-
-
+# now actually call into setuptools ..
 setup(
     name='crossbar',
-    version=verstr,
+    version=version,
     description='Crossbar.io - The Unified Application Router',
-    long_description=LONGSDESC,
+    long_description=long_description,
     author='Tavendo GmbH',
     author_email='autobahnws@googlegroups.com',
     url='http://crossbar.io/',
     platforms=('Any'),
     license="AGPL3",
     install_requires=install_requires,
-    extras_require={
-        'all': extras_require_dev,
-        'dev': extras_require_dev,
-        'oracle': extras_require_oracle,
-        'postgres': extras_require_postgres,
-    },
+    extras_require=extras_require,
     entry_points={
         'console_scripts': [
             'crossbar = crossbar.controller.cli:run'
         ]},
     packages=find_packages(),
     include_package_data=True,
-    data_files=[('.', ['LICENSE', 'COPYRIGHT'])],
+    data_files=[('.', ['COPYRIGHT', 'LICENSE', 'LICENSE-FOR-API'])],
     zip_safe=False,
+
     # http://pypi.python.org/pypi?%3Aaction=list_classifiers
-    #
     classifiers=["License :: OSI Approved :: GNU Affero General Public License v3",
                  "Development Status :: 4 - Beta",
                  "Environment :: No Input/Output (Daemon)",

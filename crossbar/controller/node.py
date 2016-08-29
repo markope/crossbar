@@ -31,21 +31,32 @@
 from __future__ import absolute_import
 
 import os
-import re
-import json
 import traceback
 import socket
 import getpass
+import pkg_resources
+import binascii
+from collections import OrderedDict
+
+import pyqrcode
+
+from nacl.signing import SigningKey
+from nacl.encoding import HexEncoder
 
 import twisted
 from twisted.internet.defer import inlineCallbacks, Deferred
 from twisted.internet.ssl import optionsForClientTLS
 
+from txaio import make_logger
+
 from autobahn.util import utcnow
+from autobahn.wamp import cryptosign
 from autobahn.wamp.types import CallDetails, CallOptions, ComponentConfig
 from autobahn.wamp.exception import ApplicationError
 from autobahn.twisted.wamp import ApplicationRunner
+from autobahn.wamp.cryptosign import _read_signify_ed25519_pubkey, _qrcode_from_signify_ed25519_pubkey
 
+import crossbar
 from crossbar.router.router import RouterFactory
 from crossbar.router.session import RouterSessionFactory
 from crossbar.router.service import RouterServiceSession
@@ -55,101 +66,130 @@ from crossbar.controller.process import NodeControllerSession
 from crossbar.controller.management import NodeManagementBridgeSession
 from crossbar.controller.management import NodeManagementSession
 
-from crossbar._logging import make_logger
-
-try:
-    import nacl  # noqa
-    HAS_NACL = True
-except ImportError:
-    HAS_NACL = False
-
 
 __all__ = ('Node',)
 
 
-def maybe_generate_key(log, cbdir, privkey_path=u'node.key'):
-    if not HAS_NACL:
-        log.warn("Skipping node key generation - NaCl package not installed!")
-        return
+def _read_release_pubkey():
+    release_pubkey_file = 'crossbar-{}.pub'.format('-'.join(crossbar.__version__.split('.')[0:2]))
+    release_pubkey_path = os.path.join(pkg_resources.resource_filename('crossbar', 'keys'), release_pubkey_file)
 
-    from nacl.signing import SigningKey
-    from nacl.encoding import HexEncoder
+    release_pubkey_hex = binascii.b2a_hex(_read_signify_ed25519_pubkey(release_pubkey_path)).decode('ascii')
 
-    privkey = None
-    privkey_path = os.path.join(cbdir, privkey_path)
+    with open(release_pubkey_path) as f:
+        release_pubkey_base64 = f.read().splitlines()[1]
 
-    if os.path.exists(privkey_path):
-        # node private key seems to exist already .. check!
-        if os.path.isfile(privkey_path):
-            with open(privkey_path, 'r') as privkey_file:
-                privkey = None
-                # parse key file lines, looking for tag "ed25519-privkey"
-                got_blankline = False
-                for line in privkey_file.read().splitlines():
-                    if line.strip() == '':
-                        got_blankline = True
-                    elif got_blankline:
-                        tag, value = line.split(':', 1)
-                        tag = tag.strip().lower()
-                        value = value.strip()
-                        if tag not in [u'private-key-ed25519', u'public-key-ed25519', u'machine-id', u'created-at', u'creator']:
-                            raise Exception("Invalid tag '{}' in node private key file {}".format(tag, privkey_path))
-                        if tag == u'private-key-ed25519':
-                            privkey = value
-                            break
+    release_pubkey_qrcode = _qrcode_from_signify_ed25519_pubkey(release_pubkey_path)
 
-                if not privkey:
-                    raise Exception("Node private key file lacks a 'ed25519-privkey' tag!")
+    release_pubkey = {
+        u'base64': release_pubkey_base64,
+        u'hex': release_pubkey_hex,
+        u'qrcode': release_pubkey_qrcode
+    }
 
-                # recreate a signing key from the base64 encoding
-                privkey_obj = SigningKey(privkey, encoder=HexEncoder)
-                pubkey = privkey_obj.verify_key.encode(encoder=HexEncoder).decode('ascii')
+    return release_pubkey
 
-            log.debug("Node key already exists (public key: {})".format(pubkey))
-        else:
-            raise Exception("Node private key path '{}' exists, but isn't a file".format(privkey_path))
+
+def _parse_keyfile(key_path, private=True):
+    """
+    Internal helper. This parses a node.pub or node.priv file and
+    returns a dict mapping tags -> values.
+    """
+    if os.path.exists(key_path) and not os.path.isfile(key_path):
+        raise Exception("Key file '{}' exists, but isn't a file".format(key_path))
+
+    allowed_tags = [u'public-key-ed25519', u'machine-id', u'created-at',
+                    u'creator']
+    if private:
+        allowed_tags.append(u'private-key-ed25519')
+
+    tags = OrderedDict()
+    with open(key_path, 'r') as key_file:
+        got_blankline = False
+        for line in key_file.readlines():
+            if line.strip() == '':
+                got_blankline = True
+            elif got_blankline:
+                tag, value = line.split(':', 1)
+                tag = tag.strip().lower()
+                value = value.strip()
+                if tag not in allowed_tags:
+                    raise Exception("Invalid tag '{}' in key file {}".format(tag, key_path))
+                if tag in tags:
+                    raise Exception("Duplicate tag '{}' in key file {}".format(tag, key_path))
+                tags[tag] = value
+    return tags
+
+
+def _read_node_pubkey(cbdir, privkey_path=u'key.priv', pubkey_path=u'key.pub'):
+
+    node_pubkey_path = os.path.join(cbdir, pubkey_path)
+
+    if not os.path.exists(node_pubkey_path):
+        raise Exception('no node public key found at {}'.format(node_pubkey_path))
+
+    node_pubkey_tags = _parse_keyfile(node_pubkey_path)
+
+    node_pubkey_hex = node_pubkey_tags[u'public-key-ed25519']
+
+    qr = pyqrcode.create(node_pubkey_hex, error='L', mode='binary')
+
+    mode = 'text'
+
+    if mode == 'text':
+        node_pubkey_qr = qr.terminal()
+
+    elif mode == 'svg':
+        import io
+        data_buffer = io.BytesIO()
+
+        qr.svg(data_buffer, omithw=True)
+
+        node_pubkey_qr = data_buffer.getvalue()
+
     else:
-        # node private key does NOT yet exist: generate one
-        privkey_obj = SigningKey.generate()
-        privkey = privkey_obj.encode(encoder=HexEncoder).decode('ascii')
-        privkey_created_at = utcnow()
+        raise Exception('logic error')
 
-        pubkey = privkey_obj.verify_key.encode(encoder=HexEncoder).decode('ascii')
+    node_pubkey = {
+        u'hex': node_pubkey_hex,
+        u'qrcode': node_pubkey_qr
+    }
 
-        # for informational purposes, try to get a machine unique id thing ..
-        machine_id = None
-        try:
-            # why this? see: http://0pointer.de/blog/projects/ids.html
-            with open('/var/lib/dbus/machine-id', 'r') as f:
-                machine_id = f.read().strip()
-        except:
-            pass
+    return node_pubkey
 
-        # for informational purposes, try to identify the creator (user@hostname)
-        creator = None
-        try:
-            creator = u'{}@{}'.format(getpass.getuser(), socket.gethostname())
-        except:
-            pass
 
-        # write out the private key file
-        with open(privkey_path, 'w') as privkey_file:
-            privkey_file.write(u'Crossbar.io private key for node authentication - KEEP THIS SAFE!\n\n')
-            if creator:
-                privkey_file.write(u'creator: {}\n'.format(creator))
-            privkey_file.write(u'created-at: {}\n'.format(privkey_created_at))
-            if machine_id:
-                privkey_file.write(u'machine-id: {}\n'.format(machine_id))
-            privkey_file.write(u'public-key-ed25519: {}\n'.format(pubkey))
-            privkey_file.write(u'private-key-ed25519: {}\n'.format(privkey))
+def _machine_id():
+    """
+    for informational purposes, try to get a machine unique id thing
+    """
+    try:
+        # why this? see: http://0pointer.de/blog/projects/ids.html
+        with open('/var/lib/dbus/machine-id', 'r') as f:
+            return f.read().strip()
+    except:
+        return None
 
-        # set file mode to read only for owner
-        # 384 (decimal) == 0600 (octal) - we use that for Py2/3 reasons
-        os.chmod(privkey_path, 384)
 
-        log.info("New node key generated!")
+def _creator():
+    """
+    for informational purposes, try to identify the creator (user@hostname)
+    """
+    try:
+        return u'{}@{}'.format(getpass.getuser(), socket.gethostname())
+    except:
+        return None
 
-    return pubkey
+
+def _write_node_key(filepath, tags, msg):
+    """
+    Internal helper.
+    Write the given tags to the given file
+    """
+    with open(filepath, 'w') as f:
+        f.write(msg)
+        for (tag, value) in tags.items():
+            if value:
+                f.write(u'{}: {}\n'.format(tag, value))
 
 
 class Node(object):
@@ -179,25 +219,139 @@ class Node(object):
             from twisted.internet import reactor
         self._reactor = reactor
 
-        # the node's name (must be unique within the management realm)
+        # the node's management realm when running in managed mode (this comes from CDC!)
+        self._management_realm = None
+
+        # the node's ID when running in managed mode (this comes from CDC!)
         self._node_id = None
 
-        # the node's management realm
-        self._realm = None
+        # node extra when running in managed mode (this comes from CDC!)
+        self._node_extra = None
+
+        # the node controller realm
+        self._realm = u'crossbar'
 
         # config of this node.
         self._config = None
+
+        # node private key autobahn.wamp.cryptosign.SigningKey
+        self._node_key = None
 
         # node controller session (a singleton ApplicationSession embedded
         # in the local node router)
         self._controller = None
 
-        # when run in "managed mode", this will hold the uplink WAMP session
-        # from the node controller to the mananagement application
+        # when running in managed mode, this will hold the bridge session
+        # attached to the local management router
+        self._bridge_session = None
+
+        # when running in managed mode, this will hold the uplink session to CDC
         self._manager = None
 
         # node shutdown triggers, one or more of checkconfig.NODE_SHUTDOWN_MODES
         self._node_shutdown_triggers = [checkconfig.NODE_SHUTDOWN_ON_WORKER_EXIT]
+
+        # map from router worker IDs to
+        self._realm_templates = {}
+
+        # for node elements started under specific IDs, and where
+        # the node configuration does not specify an ID, use a generic
+        # name numbered sequentially using the counters here
+        self._worker_no = 1
+        self._realm_no = 1
+        self._role_no = 1
+        self._connection_no = 1
+        self._transport_no = 1
+        self._component_no = 1
+
+    def maybe_generate_key(self, cbdir, privkey_path=u'key.priv', pubkey_path=u'key.pub'):
+
+        privkey_path = os.path.join(cbdir, privkey_path)
+        pubkey_path = os.path.join(cbdir, pubkey_path)
+
+        if os.path.exists(privkey_path):
+
+            # node private key seems to exist already .. check!
+
+            priv_tags = _parse_keyfile(privkey_path, private=True)
+            for tag in [u'creator', u'created-at', u'machine-id', u'public-key-ed25519', u'private-key-ed25519']:
+                if tag not in priv_tags:
+                    raise Exception("Corrupt node private key file {} - {} tag not found".format(privkey_path, tag))
+
+            privkey_hex = priv_tags[u'private-key-ed25519']
+            privkey = SigningKey(privkey_hex, encoder=HexEncoder)
+            pubkey = privkey.verify_key
+            pubkey_hex = pubkey.encode(encoder=HexEncoder).decode('ascii')
+
+            if priv_tags[u'public-key-ed25519'] != pubkey_hex:
+                raise Exception(
+                    ("Inconsistent node private key file {} - public-key-ed25519 doesn't"
+                     " correspond to private-key-ed25519").format(pubkey_path)
+                )
+
+            if os.path.exists(pubkey_path):
+                pub_tags = _parse_keyfile(pubkey_path, private=False)
+                for tag in [u'creator', u'created-at', u'machine-id', u'public-key-ed25519']:
+                    if tag not in pub_tags:
+                        raise Exception("Corrupt node public key file {} - {} tag not found".format(pubkey_path, tag))
+
+                if pub_tags[u'public-key-ed25519'] != pubkey_hex:
+                    raise Exception(
+                        ("Inconsistent node public key file {} - public-key-ed25519 doesn't"
+                         " correspond to private-key-ed25519").format(pubkey_path)
+                    )
+            else:
+                self.log.info("Node public key file {} not found - re-creating from node private key file {}".format(pubkey_path, privkey_path))
+                pub_tags = OrderedDict([
+                    (u'creator', priv_tags[u'creator']),
+                    (u'created-at', priv_tags[u'created-at']),
+                    (u'machine-id', priv_tags[u'machine-id']),
+                    (u'public-key-ed25519', pubkey_hex),
+                ])
+                msg = u'Crossbar.io node public key\n\n'
+                _write_node_key(pubkey_path, pub_tags, msg)
+
+            self.log.debug("Node key already exists (public key: {})".format(pubkey_hex))
+
+        else:
+            # node private key does not yet exist: generate one
+
+            privkey = SigningKey.generate()
+            privkey_hex = privkey.encode(encoder=HexEncoder).decode('ascii')
+            pubkey = privkey.verify_key
+            pubkey_hex = pubkey.encode(encoder=HexEncoder).decode('ascii')
+
+            # first, write the public file
+            tags = OrderedDict([
+                (u'creator', _creator()),
+                (u'created-at', utcnow()),
+                (u'machine-id', _machine_id()),
+                (u'public-key-ed25519', pubkey_hex),
+            ])
+            msg = u'Crossbar.io node public key\n\n'
+            _write_node_key(pubkey_path, tags, msg)
+
+            # now, add the private key and write the private file
+            tags[u'private-key-ed25519'] = privkey_hex
+            msg = u'Crossbar.io node private key - KEEP THIS SAFE!\n\n'
+            _write_node_key(privkey_path, tags, msg)
+
+            self.log.info("New node key pair generated!")
+
+        # fix file permissions on node public/private key files
+        # note: we use decimals instead of octals as octal literals have changed between Py2/3
+        #
+        if os.stat(pubkey_path).st_mode & 511 != 420:  # 420 (decimal) == 0644 (octal)
+            os.chmod(pubkey_path, 420)
+            self.log.info("File permissions on node public key fixed!")
+
+        if os.stat(privkey_path).st_mode & 511 != 384:  # 384 (decimal) == 0600 (octal)
+            os.chmod(privkey_path, 384)
+            self.log.info("File permissions on node private key fixed!")
+
+        self._node_key = cryptosign.SigningKey(privkey)
+
+        return pubkey_hex
 
     def load(self, configfile=None):
         """
@@ -219,93 +373,12 @@ class Node(object):
                           configfile=configfile)
         else:
             self._config = {
-                u"controller": {
-                    u"cdc": {
-                        u"enabled": True
-                    }
-                }
+                u'version': 2,
+                u'controller': {},
+                u'workers': []
             }
             checkconfig.check_config(self._config)
-            self.log.info("Node configuration loaded from built-in CDC config.")
-
-    def _prepare_node_keys(self):
-        from nacl.signing import SigningKey
-        from nacl.encoding import HexEncoder
-
-        # make sure CBDIR/.cdc exists
-        #
-        cdc_dir = os.path.join(self._cbdir, '.cdc')
-        if os.path.isdir(cdc_dir):
-            pass
-        elif os.path.exists(cdc_dir):
-            raise Exception(".cdc exists, but isn't a directory")
-        else:
-            os.mkdir(cdc_dir)
-            self.log.info("CDC directory created")
-
-        # load node ID, either from .cdc/node.id or from CDC_NODE_ID
-        #
-        def split_nid(nid_s):
-            nid_c = nid_s.strip().split('@')
-            if len(nid_c) != 2:
-                raise Exception("illegal node principal '{}' - must follow the form <node id>@<management realm>".format(nid_s))
-            node_id, realm = nid_c
-            # FIXME: regex check node_id and realm
-            return node_id, realm
-
-        nid_file = os.path.join(cdc_dir, 'node.id')
-        node_id, realm = None, None
-        if os.path.isfile(nid_file):
-            with open(nid_file, 'r') as f:
-                node_id, realm = split_nid(f.read())
-        elif os.path.exists(nid_file):
-            raise Exception("{} exists, but isn't a file".format(nid_file))
-        else:
-            if 'CDC_NODE_ID' in os.environ:
-                node_id, realm = split_nid(os.environ['CDC_NODE_ID'])
-            else:
-                raise Exception("Neither node ID file {} exists nor CDC_NODE_ID environment variable set".format(nid_file))
-
-        # Load the node key, either from .cdc/node.key or from CDC_NODE_KEY.
-        # The node key is a Ed25519 key in either raw format (32 bytes) or in
-        # hex-encoded form (64 characters).
-        #
-        # Actually, what's loaded is not the secret Ed25519 key, but the _seed_
-        # for that key. Private keys are derived from this 32-byte (256-bit)
-        # random seed value. It is thus the seed value which is sensitive and
-        # must be protected.
-        #
-        skey_file = os.path.join(cdc_dir, 'node.key')
-        skey = None
-        if os.path.isfile(skey_file):
-            # FIXME: check file permissions are 0600!
-
-            # This value is read in here.
-            skey_len = os.path.getsize(skey_file)
-            if skey_len in (32, 64):
-                with open(skey_file, 'r') as f:
-                    skey_seed = f.read()
-                    encoder = None
-                    if skey_len == 64:
-                        encoder = HexEncoder
-                    skey = SigningKey(skey_seed, encoder=encoder)
-                self.log.info("Existing CDC node key loaded from {skey_file}.", skey_file=skey_file)
-            else:
-                raise Exception("invalid node key length {} (key must either be 32 raw bytes or hex encoded 32 bytes, hence 64 byte char length)")
-        elif os.path.exists(skey_file):
-            raise Exception("{} exists, but isn't a file".format(skey_file))
-        else:
-            skey = SigningKey.generate()
-            skey_seed = skey.encode(encoder=HexEncoder)
-            with open(skey_file, 'w') as f:
-                f.write(skey_seed)
-
-            # set file mode to read only for owner
-            # 384 (decimal) == 0600 (octal) - we use that for Py2/3 reasons
-            os.chmod(skey_file, 384)
-            self.log.info("New CDC node key {skey_file} generated.", skey_file=skey_file)
-
-        return realm, node_id, skey
+            self.log.info("Node configuration loaded from built-in config.")
 
     @inlineCallbacks
     def start(self, cdc_mode=False):
@@ -316,6 +389,8 @@ class Node(object):
         if not self._config:
             raise Exception("No node configuration loaded")
 
+        # get controller config/options
+        #
         controller_config = self._config.get('controller', {})
         controller_options = controller_config.get('options', {})
 
@@ -328,112 +403,40 @@ class Node(object):
         else:
             setproctitle.setproctitle(controller_options.get('title', 'crossbar-controller'))
 
-        # the node controller realm
+        # router and factory that creates router sessions
         #
-        self._realm = controller_config.get('realm', 'crossbar')
+        self._router_factory = RouterFactory()
+        self._router_session_factory = RouterSessionFactory(self._router_factory)
 
-        # the node's name (must be unique within the management realm when running
-        # in "managed mode")
+        # create a new router for the realm
         #
-        if 'id' in controller_config:
-            self._node_id = controller_config['id']
-            self.log.info("Node ID '{node_id}' set from config", node_id=self._node_id)
-        elif 'CDC_ID' in os.environ:
-            self._node_id = u'{}'.format(os.environ['CDC_ID'])
-            self.log.info("Node ID '{node_id}' set from environment variable CDC_ID", node_id=self._node_id)
+        rlm_config = {
+            'name': self._realm
+        }
+        rlm = RouterRealm(None, rlm_config)
+        router = self._router_factory.start_realm(rlm)
+
+        # always add a realm service session
+        #
+        cfg = ComponentConfig(self._realm)
+        rlm.session = RouterServiceSession(cfg, router)
+        self._router_session_factory.add(rlm.session, authrole=u'trusted')
+
+        # add a router bridge session when running in managed mode
+        #
+        if cdc_mode:
+            self._bridge_session = NodeManagementBridgeSession(cfg)
+            self._router_session_factory.add(self._bridge_session, authrole=u'trusted')
         else:
-            self._node_id = u'{}'.format(socket.gethostname())
-            self.log.info("Node ID '{node_id}' set from hostname", node_id=self._node_id)
+            self._bridge_session = None
 
-        # standalone vs managed mode
+        # Node shutdown mode
         #
-        if 'cdc' in controller_config and controller_config['cdc'].get('enabled', False):
-
-            self._prepare_node_keys()
-
-            cdc_config = controller_config['cdc']
-
-            # CDC connecting transport
-            #
-            if 'transport' in cdc_config:
-                transport = cdc_config['transport']
-                if 'tls' in transport['endpoint']:
-                    hostname = transport['endpoint']['tls']['hostname']
-                else:
-                    raise Exception("TLS activated on CDC connection, but 'hostname' not provided")
-                self.log.warn("CDC transport configuration overridden from node config!")
-            else:
-                transport = {
-                    "type": u"websocket",
-                    "url": u"wss://devops.crossbario.com/ws",
-                    "endpoint": {
-                        "type": u"tcp",
-                        "host": u"devops.crossbario.com",
-                        "port": 443,
-                        "timeout": 5,
-                        "tls": {
-                            "hostname": u"devops.crossbario.com"
-                        }
-                    }
-                }
-                hostname = u'devops.crossbario.com'
-
-            # CDC management realm
-            #
-            if 'realm' in cdc_config:
-                realm = cdc_config['realm']
-                self.log.info("CDC management realm '{realm}' set from config", realm=realm)
-            elif 'CDC_REALM' in os.environ:
-                realm = u"{}".format(os.environ['CDC_REALM']).strip()
-                self.log.info("CDC management realm '{realm}' set from enviroment variable CDC_REALM", realm=realm)
-            else:
-                raise Exception("CDC management realm not set - either 'realm' must be set in node configuration, or in CDC_REALM enviroment variable")
-
-            # CDC authentication credentials (for WAMP-CRA)
-            #
-            authid = self._node_id
-            if 'secret' in cdc_config:
-                authkey = cdc_config['secret']
-                self.log.info("CDC authentication secret loaded from config")
-            elif 'CDC_SECRET' in os.environ:
-                authkey = u"{}".format(os.environ['CDC_SECRET']).strip()
-                self.log.info("CDC authentication secret loaded from environment variable CDC_SECRET")
-            else:
-                raise Exception("CDC authentication secret not set - either 'secret' must be set in node configuration, or in CDC_SECRET enviroment variable")
-
-            # extra info forwarded to CDC client session
-            #
-            extra = {
-                'node': self,
-                'onready': Deferred(),
-                'onexit': Deferred(),
-                'authid': authid,
-                'authkey': authkey
-            }
-
-            runner = ApplicationRunner(
-                url=transport['url'], realm=realm, extra=extra,
-                ssl=optionsForClientTLS(hostname),
-                debug=False
-            )
-
-            try:
-                self.log.info("Connecting to CDC at '{url}' ..", url=transport['url'])
-                yield runner.run(NodeManagementSession, start_reactor=False)
-
-                # wait until we have attached to the uplink CDC
-                self._manager = yield extra['onready']
-            except Exception as e:
-                raise Exception("Could not connect to CDC - {}".format(e))
-
+        if cdc_mode:
             # in managed mode, a node - by default - only shuts down when explicitly asked to,
             # or upon a fatal error in the node controller
             self._node_shutdown_triggers = [checkconfig.NODE_SHUTDOWN_ON_SHUTDOWN_REQUESTED]
-
-            self.log.info("Connected to Crossbar.io DevOps Center (CDC)! Your node runs in managed mode.")
         else:
-            self._manager = None
-
             # in standalone mode, a node - by default - is immediately shutting down whenever
             # a worker exits (successfully or with error)
             self._node_shutdown_triggers = [checkconfig.NODE_SHUTDOWN_ON_WORKER_EXIT]
@@ -446,40 +449,12 @@ class Node(object):
         else:
             self.log.info("Using default node shutdown triggers {}".format(self._node_shutdown_triggers))
 
-        # router and factory that creates router sessions
-        #
-        self._router_factory = RouterFactory(self._node_id)
-        self._router_session_factory = RouterSessionFactory(self._router_factory)
-
-        rlm_config = {
-            'name': self._realm
-        }
-        rlm = RouterRealm(None, rlm_config)
-
-        # create a new router for the realm
-        router = self._router_factory.start_realm(rlm)
-
-        # add a router/realm service session
-        cfg = ComponentConfig(self._realm)
-
-        rlm.session = RouterServiceSession(cfg, router)
-        self._router_session_factory.add(rlm.session, authrole=u'trusted')
-
-        if self._manager:
-            self._bridge_session = NodeManagementBridgeSession(cfg, self, self._manager)
-            self._router_session_factory.add(self._bridge_session, authrole=u'trusted')
-        else:
-            self._bridge_session = None
-
-        # the node controller singleton WAMP application session
+        # add the node controller singleton session
         #
         self._controller = NodeControllerSession(self)
-
-        # add the node controller singleton session to the router
-        #
         self._router_session_factory.add(self._controller, authrole=u'trusted')
 
-        # Detect WAMPlets
+        # detect WAMPlets (FIXME: remove this!)
         #
         wamplets = self._controller._get_wamplets()
         if len(wamplets) > 0:
@@ -492,12 +467,105 @@ class Node(object):
             self.log.debug("No WAMPlets detected in enviroment.")
 
         panic = False
-
         try:
+            # startup the node from local node configuration
+            #
             yield self._startup(self._config)
+
+            # connect to CDC when running in managed mode
+            #
+            if cdc_mode:
+                cdc_config = controller_config.get('cdc', {
+
+                    # CDC connecting transport
+                    u'transport': {
+                        u'type': u'websocket',
+                        u'url': u'wss://cdc.crossbario.com/ws',
+                        u'endpoint': {
+                            u'type': u'tcp',
+                            u'host': u'cdc.crossbario.com',
+                            u'port': 443,
+                            u'timeout': 5,
+                            u'tls': {
+                                u'hostname': u'cdc.crossbario.com'
+                            }
+                        }
+                    }
+                })
+
+                transport = cdc_config[u'transport']
+                hostname = None
+                if u'tls' in transport[u'endpoint']:
+                    transport[u'endpoint'][u'tls'][u'hostname']
+
+                runner = ApplicationRunner(
+                    url=transport['url'],
+                    realm=None,
+                    extra=None,
+                    ssl=optionsForClientTLS(hostname) if hostname else None,
+                )
+
+                def make(config):
+                    # extra info forwarded to CDC client session
+                    extra = {
+                        'node': self,
+                        'on_ready': Deferred(),
+                        'on_exit': Deferred(),
+                        'node_key': self._node_key,
+                    }
+
+                    @inlineCallbacks
+                    def on_ready(res):
+                        self._manager, self._management_realm, self._node_id, self._node_extra = res
+
+                        if self._bridge_session:
+                            try:
+                                yield self._bridge_session.attach_manager(self._manager, self._management_realm, self._node_id)
+                                status = yield self._manager.call(u'com.crossbario.cdc.general.get_status@1')
+                            except:
+                                self.log.failure()
+                            else:
+                                self.log.info('Connected to CDC for management realm "{realm}" (current time is {now})', realm=self._management_realm, now=status[u'now'])
+                        else:
+                            self.log.warn('Uplink CDC session established, but no bridge session setup!')
+
+                    @inlineCallbacks
+                    def on_exit(res):
+                        if self._bridge_session:
+                            try:
+                                yield self._bridge_session.detach_manager()
+                            except:
+                                self.log.failure()
+                            else:
+                                self.log.info('Disconnected from CDC for management realm "{realm}"', realm=self._management_realm)
+                        else:
+                            self.log.warn('Uplink CDC session lost, but no bridge session setup!')
+
+                        self._manager, self._management_realm, self._node_id, self._node_extra = None, None, None, None
+
+                    extra['on_ready'].addCallback(on_ready)
+                    extra['on_exit'].addCallback(on_exit)
+
+                    config = ComponentConfig(extra=extra)
+                    session = NodeManagementSession(config)
+
+                    return session
+
+                self.log.info("Connecting to CDC at '{url}' ..", url=transport[u'url'])
+                yield runner.run(make, start_reactor=False, auto_reconnect=True)
+
+            # Notify systemd that crossbar is fully up and running
+            # (this has no effect on non-systemd platforms)
+            try:
+                import sdnotify
+                sdnotify.SystemdNotifier().notify("READY=1")
+            except:
+                pass
+
         except ApplicationError as e:
             panic = True
             self.log.error("{msg}", msg=e.error_message())
+
         except Exception:
             panic = True
             traceback.print_exc()
@@ -510,57 +578,57 @@ class Node(object):
 
     @inlineCallbacks
     def _startup(self, config):
-        # fake call details information when calling into
-        # remoted procedure locally
-        #
+        """
+        Startup elements in the node as specified in the provided node configuration.
+        """
+        self.log.info('Configuring node from config ..')
+
+        # call options we use to call into the local node management API
+        call_options = CallOptions()
+
+        # fake call details we use to call into the local node management API
         call_details = CallDetails(caller=0)
 
+        # get contoller configuration subpart
         controller = config.get('controller', {})
 
         # start Manhole in node controller
-        #
         if 'manhole' in controller:
             yield self._controller.start_manhole(controller['manhole'], details=call_details)
 
         # startup all workers
-        #
-        worker_no = 1
-
-        call_options = CallOptions(disclose_me=True)
-
         for worker in config.get('workers', []):
-            # worker ID, type and logname
-            #
+
+            # worker ID
             if 'id' in worker:
                 worker_id = worker.pop('id')
             else:
-                worker_id = 'worker{}'.format(worker_no)
-                worker_no += 1
+                worker_id = 'worker-{:03d}'.format(self._worker_no)
+                self._worker_no += 1
 
+            # worker type - a type of working process from the following fixed list
             worker_type = worker['type']
-            worker_options = worker.get('options', {})
+            assert(worker_type in ['router', 'container', 'guest', 'websocket-testee'])
 
+            # set logname depending on worker type
             if worker_type == 'router':
                 worker_logname = "Router '{}'".format(worker_id)
-
             elif worker_type == 'container':
                 worker_logname = "Container '{}'".format(worker_id)
-
             elif worker_type == 'websocket-testee':
                 worker_logname = "WebSocketTestee '{}'".format(worker_id)
-
             elif worker_type == 'guest':
                 worker_logname = "Guest '{}'".format(worker_id)
-
             else:
                 raise Exception("logic error")
 
-            # router/container
-            #
+            # any worker specific options
+            worker_options = worker.get('options', {})
+
+            # native worker processes: router, container, websocket-testee
             if worker_type in ['router', 'container', 'websocket-testee']:
 
                 # start a new native worker process ..
-                #
                 if worker_type == 'router':
                     yield self._controller.start_router(worker_id, worker_options, details=call_details)
 
@@ -574,149 +642,99 @@ class Node(object):
                     raise Exception("logic error")
 
                 # setup native worker generic stuff
-                #
                 if 'pythonpath' in worker_options:
-                    added_paths = yield self._controller.call('crossbar.node.{}.worker.{}.add_pythonpath'.format(self._node_id, worker_id), worker_options['pythonpath'], options=call_options)
+                    added_paths = yield self._controller.call('crossbar.worker.{}.add_pythonpath'.format(worker_id), worker_options['pythonpath'], options=call_options)
                     self.log.debug("{worker}: PYTHONPATH extended for {paths}",
                                    worker=worker_logname, paths=added_paths)
 
                 if 'cpu_affinity' in worker_options:
-                    new_affinity = yield self._controller.call('crossbar.node.{}.worker.{}.set_cpu_affinity'.format(self._node_id, worker_id), worker_options['cpu_affinity'], options=call_options)
+                    new_affinity = yield self._controller.call('crossbar.worker.{}.set_cpu_affinity'.format(worker_id), worker_options['cpu_affinity'], options=call_options)
                     self.log.debug("{worker}: CPU affinity set to {affinity}",
                                    worker=worker_logname, affinity=new_affinity)
 
                 if 'manhole' in worker:
-                    yield self._controller.call('crossbar.node.{}.worker.{}.start_manhole'.format(self._node_id, worker_id), worker['manhole'], options=call_options)
+                    yield self._controller.call('crossbar.worker.{}.start_manhole'.format(worker_id), worker['manhole'], options=call_options)
                     self.log.debug("{worker}: manhole started",
                                    worker=worker_logname)
 
                 # setup router worker
-                #
                 if worker_type == 'router':
 
                     # start realms on router
-                    #
-                    realm_no = 1
-
                     for realm in worker.get('realms', []):
 
+                        # start realm
                         if 'id' in realm:
                             realm_id = realm.pop('id')
                         else:
-                            realm_id = 'realm{}'.format(realm_no)
-                            realm_no += 1
+                            realm_id = 'realm-{:03d}'.format(self._realm_no)
+                            self._realm_no += 1
 
-                        # extract schema information from WAMP-flavored Markdown
-                        #
-                        schemas = None
-                        if 'schemas' in realm:
-                            schemas = {}
-                            schema_pat = re.compile(r"```javascript(.*?)```", re.DOTALL)
-                            cnt_files = 0
-                            cnt_decls = 0
-                            for schema_file in realm.pop('schemas'):
-                                schema_file = os.path.join(self._cbdir, schema_file)
-                                self.log.info("{worker}: processing WAMP-flavored Markdown file {schema_file} for WAMP schema declarations",
-                                              worker=worker_logname, schema_file=schema_file)
-                                with open(schema_file, 'r') as f:
-                                    cnt_files += 1
-                                    for d in schema_pat.findall(f.read()):
-                                        try:
-                                            o = json.loads(d)
-                                            if isinstance(o, dict) and '$schema' in o and o['$schema'] == u'http://wamp.ws/schema#':
-                                                uri = o['uri']
-                                                if uri not in schemas:
-                                                    schemas[uri] = {}
-                                                schemas[uri].update(o)
-                                                cnt_decls += 1
-                                        except Exception:
-                                            self.log.failure("{worker}: WARNING - failed to process declaration in {schema_file} - {log_failure.value}",
-                                                             worker=worker_logname, schema_file=schema_file)
-                            self.log.info("{worker}: processed {cnt_files} files extracting {cnt_decls} schema declarations and {len_schemas} URIs",
-                                          worker=worker_logname, cnt_files=cnt_files, cnt_decls=cnt_decls, len_schemas=len(schemas))
-
-                        enable_trace = realm.get('trace', False)
-                        yield self._controller.call('crossbar.node.{}.worker.{}.start_router_realm'.format(self._node_id, worker_id), realm_id, realm, schemas, enable_trace=enable_trace, options=call_options)
+                        yield self._controller.call('crossbar.worker.{}.start_router_realm'.format(worker_id), realm_id, realm, options=call_options)
                         self.log.info("{worker}: realm '{realm_id}' (named '{realm_name}') started",
-                                      worker=worker_logname, realm_id=realm_id, realm_name=realm['name'], enable_trace=enable_trace)
+                                      worker=worker_logname, realm_id=realm_id, realm_name=realm['name'])
 
                         # add roles to realm
-                        #
-                        role_no = 1
                         for role in realm.get('roles', []):
                             if 'id' in role:
                                 role_id = role.pop('id')
                             else:
-                                role_id = 'role{}'.format(role_no)
-                                role_no += 1
+                                role_id = 'role-{:03d}'.format(self._role_no)
+                                self._role_no += 1
 
-                            yield self._controller.call('crossbar.node.{}.worker.{}.start_router_realm_role'.format(self._node_id, worker_id), realm_id, role_id, role, options=call_options)
+                            yield self._controller.call('crossbar.worker.{}.start_router_realm_role'.format(worker_id), realm_id, role_id, role, options=call_options)
                             self.log.info("{}: role '{}' (named '{}') started on realm '{}'".format(worker_logname, role_id, role['name'], realm_id))
 
                         # start uplinks for realm
-                        #
-                        uplink_no = 1
                         for uplink in realm.get('uplinks', []):
                             if 'id' in uplink:
                                 uplink_id = uplink.pop('id')
                             else:
-                                uplink_id = 'uplink{}'.format(uplink_no)
-                                uplink_no += 1
+                                uplink_id = 'uplink-{:03d}'.format(self._uplink_no)
+                                self._uplink_no += 1
 
-                            yield self._controller.call('crossbar.node.{}.worker.{}.start_router_realm_uplink'.format(self._node_id, worker_id), realm_id, uplink_id, uplink, options=call_options)
+                            yield self._controller.call('crossbar.worker.{}.start_router_realm_uplink'.format(worker_id), realm_id, uplink_id, uplink, options=call_options)
                             self.log.info("{}: uplink '{}' started on realm '{}'".format(worker_logname, uplink_id, realm_id))
 
                     # start connections (such as PostgreSQL database connection pools)
                     # to run embedded in the router
-                    #
-                    connection_no = 1
-
                     for connection in worker.get('connections', []):
 
                         if 'id' in connection:
                             connection_id = connection.pop('id')
                         else:
-                            connection_id = 'connection{}'.format(connection_no)
-                            connection_no += 1
+                            connection_id = 'connection-{:03d}'.format(self._connection_no)
+                            self._connection_no += 1
 
-                        yield self._controller.call('crossbar.node.{}.worker.{}.start_connection'.format(self._node_id, worker_id), connection_id, connection, options=call_options)
+                        yield self._controller.call('crossbar.worker.{}.start_connection'.format(worker_id), connection_id, connection, options=call_options)
                         self.log.info("{}: connection '{}' started".format(worker_logname, connection_id))
 
                     # start components to run embedded in the router
-                    #
-                    component_no = 1
-
                     for component in worker.get('components', []):
 
                         if 'id' in component:
                             component_id = component.pop('id')
                         else:
-                            component_id = 'component{}'.format(component_no)
-                            component_no += 1
+                            component_id = 'component-{:03d}'.format(self._component_no)
+                            self._component_no += 1
 
-                        yield self._controller.call('crossbar.node.{}.worker.{}.start_router_component'.format(self._node_id, worker_id), component_id, component, options=call_options)
+                        yield self._controller.call('crossbar.worker.{}.start_router_component'.format(worker_id), component_id, component, options=call_options)
                         self.log.info("{}: component '{}' started".format(worker_logname, component_id))
 
                     # start transports on router
-                    #
-                    transport_no = 1
-
                     for transport in worker['transports']:
 
                         if 'id' in transport:
                             transport_id = transport.pop('id')
                         else:
-                            transport_id = 'transport{}'.format(transport_no)
-                            transport_no += 1
+                            transport_id = 'transport-{:03d}'.format(self._transport_no)
+                            self._transport_no += 1
 
-                        yield self._controller.call('crossbar.node.{}.worker.{}.start_router_transport'.format(self._node_id, worker_id), transport_id, transport, options=call_options)
+                        yield self._controller.call('crossbar.worker.{}.start_router_transport'.format(worker_id), transport_id, transport, options=call_options)
                         self.log.info("{}: transport '{}' started".format(worker_logname, transport_id))
 
                 # setup container worker
-                #
                 elif worker_type == 'container':
-
-                    component_no = 1
 
                     # if components exit "very soon after" we try to
                     # start them, we consider that a failure and shut
@@ -732,23 +750,21 @@ class Node(object):
                             self._reactor.stop()
                         except twisted.internet.error.ReactorNotRunning:
                             pass
-                    topic = 'crossbar.node.{}.worker.{}.container.on_component_stop'.format(self._node_id, worker_id)
+                    topic = 'crossbar.worker.{}.container.on_component_stop'.format(worker_id)
                     component_stop_sub = yield self._controller.subscribe(component_exited, topic)
 
                     # start connections (such as PostgreSQL database connection pools)
                     # to run embedded in the container
                     #
-                    connection_no = 1
-
                     for connection in worker.get('connections', []):
 
                         if 'id' in connection:
                             connection_id = connection.pop('id')
                         else:
-                            connection_id = 'connection{}'.format(connection_no)
-                            connection_no += 1
+                            connection_id = 'connection-{:03d}'.format(self._connection_no)
+                            self._connection_no += 1
 
-                        yield self._controller.call('crossbar.node.{}.worker.{}.start_connection'.format(self._node_id, worker_id), connection_id, connection, options=call_options)
+                        yield self._controller.call('crossbar.worker.{}.start_connection'.format(worker_id), connection_id, connection, options=call_options)
                         self.log.info("{}: connection '{}' started".format(worker_logname, connection_id))
 
                     # start components to run embedded in the container
@@ -758,10 +774,10 @@ class Node(object):
                         if 'id' in component:
                             component_id = component.pop('id')
                         else:
-                            component_id = 'component{}'.format(component_no)
-                            component_no += 1
+                            component_id = 'component-{:03d}'.format(self._component_no)
+                            self._component_no += 1
 
-                        yield self._controller.call('crossbar.node.{}.worker.{}.start_container_component'.format(self._node_id, worker_id), component_id, component, options=call_options)
+                        yield self._controller.call('crossbar.worker.{}.start_container_component'.format(worker_id), component_id, component, options=call_options)
                         self.log.info("{worker}: component '{component_id}' started",
                                       worker=worker_logname, component_id=component_id)
 
@@ -769,16 +785,14 @@ class Node(object):
                     self._reactor.callLater(2, component_stop_sub.unsubscribe)
 
                 # setup websocket-testee worker
-                #
                 elif worker_type == 'websocket-testee':
 
-                    # start transports on router
-                    #
+                    # start transport on websocket-testee
                     transport = worker['transport']
-                    transport_no = 1
-                    transport_id = 'transport{}'.format(transport_no)
+                    transport_id = 'transport-{:03d}'.format(self._transport_no)
+                    self._transport_no = 1
 
-                    yield self._controller.call('crossbar.node.{}.worker.{}.start_websocket_testee_transport'.format(self._node_id, worker_id), transport_id, transport, options=call_options)
+                    yield self._controller.call('crossbar.worker.{}.start_websocket_testee_transport'.format(worker_id), transport_id, transport, options=call_options)
                     self.log.info("{}: transport '{}' started".format(worker_logname, transport_id))
 
                 else:

@@ -42,6 +42,8 @@ from nacl.exceptions import BadSignatureError
 from autobahn import util
 from autobahn.wamp import types
 
+from txaio import make_logger
+
 from crossbar.router.auth.pending import PendingAuth
 
 __all__ = ('PendingAuthCryptosign',)
@@ -52,12 +54,17 @@ class PendingAuthCryptosign(PendingAuth):
     Pending Cryptosign authentication.
     """
 
+    log = make_logger()
+
     AUTHMETHOD = u'cryptosign'
 
     def __init__(self, session, config):
         PendingAuth.__init__(self, session, config)
         self._verify_key = None
 
+        # https://tools.ietf.org/html/rfc5056
+        # https://tools.ietf.org/html/rfc5929
+        # https://www.ietf.org/proceedings/90/slides/slides-90-uta-0.pdf
         channel_id_hex = session._transport._transport_info.get(u'channel_id', None)
         if channel_id_hex:
             self._channel_id = binascii.a2b_hex(channel_id_hex)
@@ -75,7 +82,7 @@ class PendingAuthCryptosign(PendingAuth):
                 for pubkey in principal[u'authorized_keys']:
                     self._pubkey_to_authid[pubkey] = authid
 
-    def _compute_challenge(self):
+    def _compute_challenge(self, channel_binding):
         self._challenge = os.urandom(32)
 
         if self._channel_id:
@@ -89,9 +96,12 @@ class PendingAuthCryptosign(PendingAuth):
         return extra
 
     def hello(self, realm, details):
-
+        # the channel binding requested by the client authenticating
         channel_binding = details.authextra.get(u'channel_binding', None)
-        print("WAMP-cryptosign CHANNEL BINDING requested: {}".format(channel_binding))
+        if channel_binding is not None and channel_binding not in [u'tls-unique']:
+            return types.Deny(message=u'invalid channel binding type "{}" requested'.format(channel_binding))
+        else:
+            self.log.info("WAMP-cryptosign CHANNEL BINDING requested: {}".format(channel_binding))
 
         # remember the realm the client requested to join (if any)
         self._realm = realm
@@ -117,7 +127,7 @@ class PendingAuthCryptosign(PendingAuth):
                     # we do a naive search, but that is ok, since "static mode" is from
                     # node configuration, and won't contain a lot principals anyway
                     for _authid, _principal in self._config.get(u'principals', {}).items():
-                        if _principal[u'pubkey'] == pubkey:
+                        if pubkey in _principal[u'authorized_keys']:
                             # (*): this is necessary to detect multiple authid's having the same pubkey
                             # in which case we couldn't reliably map the authid from the pubkey
                             if self._authid is None:
@@ -142,8 +152,9 @@ class PendingAuthCryptosign(PendingAuth):
 
                 self._verify_key = VerifyKey(pubkey, encoder=nacl.encoding.HexEncoder)
 
-                extra = self._compute_challenge()
+                extra = self._compute_challenge(channel_binding)
                 return types.Challenge(self._authmethod, extra)
+
             else:
                 return types.Deny(message=u'no principal with authid "{}" exists'.format(details.authid))
 
@@ -155,6 +166,9 @@ class PendingAuthCryptosign(PendingAuth):
             if error:
                 return error
 
+            self._session_details[u'authmethod'] = u'cryptosign'
+            self._session_details[u'authextra'] = details.authextra
+
             d = self._authenticator_session.call(self._authenticator, realm, details.authid, self._session_details)
 
             def on_authenticate_ok(principal):
@@ -164,7 +178,7 @@ class PendingAuthCryptosign(PendingAuth):
 
                 self._verify_key = VerifyKey(principal[u'pubkey'], encoder=nacl.encoding.HexEncoder)
 
-                extra = self._compute_challenge()
+                extra = self._compute_challenge(channel_binding)
                 return types.Challenge(self._authmethod, extra)
 
             def on_authenticate_error(err):

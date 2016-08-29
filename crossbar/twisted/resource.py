@@ -32,20 +32,18 @@ import os
 
 import json
 import time
-import cgi  # for POST Request Header decoding
-import shutil
 
 from twisted.web import http, server
 from twisted.web.http import NOT_FOUND
 from twisted.web.resource import Resource, NoResource
 from twisted.web.static import File
+from twisted.web.proxy import ReverseProxyResource  # noqa (Republish resource)
 from twisted.python.filepath import FilePath
 
-from autobahn.wamp.types import PublishOptions
+from txaio import make_logger
 
 import crossbar
 from crossbar._compat import native_string
-from crossbar._logging import make_logger
 from crossbar.router import longpoll
 
 try:
@@ -114,6 +112,7 @@ class JsonResource(Resource):
             self.log.debug("Served {requests_served} requests", requests_served=self._requests_served)
 
         return self._data
+
 
 
 class FileUploadResource(Resource):
@@ -533,7 +532,6 @@ class FileUploadResource(Resource):
             request.setResponseCode(404, msg)
             return msg
 
-
 class Resource404(Resource):
 
     """
@@ -665,11 +663,11 @@ class WampLongPollResourceSession(longpoll.WampLongPollResourceSession):
     def __init__(self, parent, transport_details):
         longpoll.WampLongPollResourceSession.__init__(self, parent, transport_details)
         self._transport_info = {
-            'type': 'longpoll',
-            'protocol': transport_details['protocol'],
-            'peer': transport_details['peer'],
-            'http_headers_received': transport_details['http_headers_received'],
-            'http_headers_sent': transport_details['http_headers_sent']
+            u'type': 'longpoll',
+            u'protocol': transport_details['protocol'],
+            u'peer': transport_details['peer'],
+            u'http_headers_received': transport_details['http_headers_received'],
+            u'http_headers_sent': transport_details['http_headers_sent']
         }
         self._cbtid = None
 
@@ -690,7 +688,7 @@ class WampLongPollResource(longpoll.WampLongPollResource):
             content = content.encode('utf8')
             return content
         except Exception:
-            self.log.failure("Error rendering LongPoll notice page template: {failure}")
+            self.log.failure("Error rendering LongPoll notice page template: {log_failure.value}")
 
 
 class SchemaDocResource(Resource):

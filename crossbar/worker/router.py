@@ -39,7 +39,7 @@ import six
 
 from datetime import datetime
 
-from twisted.internet.defer import Deferred, DeferredList
+from twisted.internet.defer import Deferred, DeferredList, maybeDeferred
 from twisted.internet.defer import inlineCallbacks
 from twisted.python.failure import Failure
 from twisted.python.threadpool import ThreadPool
@@ -50,6 +50,7 @@ from autobahn.wamp.exception import ApplicationError
 
 from crossbar.twisted.resource import StaticResource, StaticResourceNoListing
 
+from crossbar._util import class_name
 from crossbar.router import uplink
 from crossbar.router.session import RouterSessionFactory
 from crossbar.router.service import RouterServiceSession
@@ -58,13 +59,15 @@ from crossbar.router.router import RouterFactory
 from crossbar.router.protocol import WampWebSocketServerFactory, \
     WampRawSocketServerFactory
 
+from crossbar.router.unisocket import UniSocketServerFactory
+
 from crossbar.worker import _appsession_loader
 from crossbar.worker.testee import WebSocketTesteeServerFactory, \
     StreamTesteeServerFactory
 
 from crossbar.twisted.endpoint import create_listening_port_from_config
 
-from autobahn.wamp.types import RegisterOptions
+from autobahn.wamp.types import RegisterOptions, PublishOptions
 
 try:
     from twisted.web.wsgi import WSGIResource
@@ -87,8 +90,10 @@ from crossbar.twisted.site import createHSTSRequestFactory
 
 from crossbar.twisted.resource import JsonResource, \
     Resource404, \
-    FileUploadResource, \
-    RedirectResource
+    RedirectResource, \
+    ReverseProxyResource
+
+from crossbar.twisted.fileupload import FileUploadResource
 
 from crossbar.twisted.flashpolicy import FlashPolicyFactory
 
@@ -171,6 +176,20 @@ class RouterComponent(object):
         self.session = session
         self.created = datetime.utcnow()
 
+    def marshal(self):
+        """
+        Marshal object information for use with WAMP calls/events.
+        """
+        now = datetime.utcnow()
+        return {
+            u'id': self.id,
+            # 'started' is used by container-components; keeping it
+            # for consistency in the public API
+            u'started': utcstr(self.created),
+            u'uptime': (now - self.created).total_seconds(),
+            u'config': self.config
+        }
+
 
 class RouterRealm(object):
 
@@ -252,7 +271,7 @@ class RouterWorkerSession(NativeWorkerSession):
         yield NativeWorkerSession.onJoin(self, details, publish_ready=False)
 
         # factory for producing (per-realm) routers
-        self._router_factory = RouterFactory(self._node_id)
+        self._router_factory = RouterFactory()
 
         # factory for producing router sessions
         self._router_session_factory = RouterSessionFactory(self._router_factory)
@@ -310,14 +329,14 @@ class RouterWorkerSession(NativeWorkerSession):
         Get realms currently running on this router worker.
 
         :returns: List of realms currently running.
-        :rtype: list of dict
+        :rtype: list of str
         """
         self.log.debug("{}.get_router_realms".format(self.__class__.__name__))
 
-        raise Exception("not implemented")
+        return sorted(self.realms.keys())
 
     @inlineCallbacks
-    def start_router_realm(self, id, config, schemas=None, enable_trace=False, details=None):
+    def start_router_realm(self, realm_id, config, enable_trace=False, details=None):
         """
         Starts a realm on this router worker.
 
@@ -325,16 +344,14 @@ class RouterWorkerSession(NativeWorkerSession):
         :type id: str
         :param config: The realm configuration.
         :type config: dict
-        :param schemas: An (optional) initial schema dictionary to load.
-        :type schemas: dict
         """
         self.log.debug("{}.start_router_realm".format(self.__class__.__name__),
-                       id=id, config=config, schemas=schemas)
+                       realm_id=realm_id, config=config)
 
         # prohibit starting a realm twice
         #
-        if id in self.realms:
-            emsg = "Could not start realm: a realm with ID '{}' is already running (or starting)".format(id)
+        if realm_id in self.realms:
+            emsg = "Could not start realm: a realm with ID '{}' is already running (or starting)".format(realm_id)
             self.log.error(emsg)
             raise ApplicationError(u'crossbar.error.already_running', emsg)
 
@@ -351,9 +368,9 @@ class RouterWorkerSession(NativeWorkerSession):
         realm = config['name']
 
         # track realm
-        rlm = RouterRealm(id, config)
-        self.realms[id] = rlm
-        self.realm_to_id[realm] = id
+        rlm = RouterRealm(realm_id, config)
+        self.realms[realm_id] = rlm
+        self.realm_to_id[realm] = realm_id
 
         # create a new router for the realm
         router = self._router_factory.start_realm(rlm)
@@ -368,14 +385,16 @@ class RouterWorkerSession(NativeWorkerSession):
             'onready': Deferred()
         }
         cfg = ComponentConfig(realm, extra)
-        rlm.session = RouterServiceSession(cfg, router, schemas=schemas)
+        rlm.session = RouterServiceSession(cfg, router)
         self._router_session_factory.add(rlm.session, authrole=u'trusted')
 
         yield extra['onready']
 
         self.log.info("Realm '{realm}' started", realm=realm)
 
-    def stop_router_realm(self, id, close_sessions=False, details=None):
+        self.publish(u'{}.on_realm_started'.format(self._uri_prefix), realm_id)
+
+    def stop_router_realm(self, realm_id, close_sessions=False, details=None):
         """
         Stop a realm currently running on this router worker.
 
@@ -388,7 +407,7 @@ class RouterWorkerSession(NativeWorkerSession):
         :type close_sessions: bool
         """
         self.log.debug("{}.stop_router_realm".format(self.__class__.__name__),
-                       id=id, close_sessions=close_sessions)
+                       realm_id=realm_id, close_sessions=close_sessions)
 
         # FIXME
         raise NotImplementedError()
@@ -434,6 +453,11 @@ class RouterWorkerSession(NativeWorkerSession):
 
         realm = self.realms[id].config['name']
         self._router_factory.add_role(realm, config)
+
+        topic = self._uri_prefix + '.on_router_realm_role_started'
+        event = {u'id': id}
+        caller = details.caller if details else None
+        self.publish(topic, event, options=PublishOptions(exclude=caller))
 
     def stop_router_realm_role(self, id, role_id, details=None):
         """
@@ -509,9 +533,9 @@ class RouterWorkerSession(NativeWorkerSession):
         # wait until the uplink is ready
         try:
             uplink_session = yield extra['onready']
-        except Exception as e:
-            self.log.error(e)
-            raise e
+        except Exception:
+            self.log.failure(None)
+            raise
 
         self.realms[realm_id].uplinks[uplink_id].session = uplink_session
 
@@ -543,11 +567,34 @@ class RouterWorkerSession(NativeWorkerSession):
         res = []
         for component in sorted(self.components.values(), key=lambda c: c.created):
             res.append({
-                'id': component.id,
-                'created': utcstr(component.created),
-                'config': component.config,
+                u'id': component.id,
+                u'created': utcstr(component.created),
+                u'config': component.config,
             })
         return res
+
+    def onLeave(self, details):
+        # when this router is shutting down, we disconnect all our
+        # components so that they have a chance to shutdown properly
+        # -- e.g. on a ctrl-C of the router.
+        leaves = []
+        for component in self.components.values():
+            if component.session.is_connected():
+                d = maybeDeferred(component.session.leave)
+
+                def done(_):
+                    self.log.info(
+                        "component '{id}' disconnected",
+                        id=component.id,
+                    )
+                    component.session.disconnect()
+                d.addCallback(done)
+                leaves.append(d)
+        dl = DeferredList(leaves, consumeErrors=True)
+        # we want our default behavior, which disconnects this
+        # router-worker, effectively shutting it down .. but only
+        # *after* the components got a chance to shutdown.
+        dl.addBoth(lambda _: super(RouterWorkerSession, self).onLeave(details))
 
     def start_router_component(self, id, config, details=None):
         """
@@ -625,9 +672,43 @@ class RouterWorkerSession(NativeWorkerSession):
             )
             raise
 
+        # Note that 'join' is fired to listeners *before* onJoin runs,
+        # so if you do 'yield self.leave()' in onJoin we'll still
+        # publish "started" before "stopped".
+
+        def publish_stopped(session, stop_details):
+            self.log.info(
+                "stopped component: {session} id={session_id}",
+                session=class_name(session),
+                session_id=session._session_id,
+            )
+            topic = self._uri_prefix + '.on_component_stop'
+            event = {u'id': id}
+            caller = details.caller if details else None
+            self.publish(topic, event, options=PublishOptions(exclude=caller))
+            return event
+
+        def publish_started(session, start_details):
+            self.log.info(
+                "started component: {session} id={session_id}",
+                session=class_name(session),
+                session_id=session._session_id,
+            )
+            topic = self._uri_prefix + '.on_component_start'
+            event = {u'id': id}
+            caller = details.caller if details else None
+            self.publish(topic, event, options=PublishOptions(exclude=caller))
+            return event
+        session.on('leave', publish_stopped)
+        session.on('join', publish_started)
+
         self.components[id] = RouterComponent(id, config, session)
         self._router_session_factory.add(session, authrole=config.get('role', u'anonymous'))
-        self.log.debug("Added component {id}", id=id)
+        self.log.debug(
+            "Added component {id} (type '{name}')",
+            id=id,
+            name=class_name(session),
+        )
 
     def stop_router_component(self, id, details=None):
         """
@@ -662,9 +743,9 @@ class RouterWorkerSession(NativeWorkerSession):
         res = []
         for transport in sorted(self.transports.values(), key=lambda c: c.created):
             res.append({
-                'id': transport.id,
-                'created': utcstr(transport.created),
-                'config': transport.config,
+                u'id': transport.id,
+                u'created': utcstr(transport.created),
+                u'config': transport.config,
             })
         return res
 
@@ -734,42 +815,33 @@ class RouterWorkerSession(NativeWorkerSession):
         #
         elif config['type'] == 'web':
 
-            options = config.get('options', {})
+            transport_factory = self._create_web_factory(config)
 
-            # create Twisted Web root resource
-            #
-            if '/' in config['paths']:
-                root_config = config['paths']['/']
-                root = self._create_resource(root_config, nested=False)
+        # Universal transport
+        #
+        elif config['type'] == 'universal':
+            if 'web' in config:
+                web_factory = self._create_web_factory(config['web'])
             else:
-                root = Resource404(self._templates, b'')
+                web_factory = None
 
-            # create Twisted Web resources on all non-root paths configured
-            #
-            self._add_paths(root, config.get('paths', {}))
+            if 'rawsocket' in config:
+                rawsocket_factory = WampRawSocketServerFactory(self._router_session_factory, config['rawsocket'])
+                rawsocket_factory.noisy = False
+            else:
+                rawsocket_factory = None
 
-            # create the actual transport factory
-            #
-            transport_factory = Site(root)
-            transport_factory.noisy = False
+            if 'websocket' in config:
+                websocket_factory_map = {}
+                for websocket_url_first_component, websocket_config in config['websocket'].items():
+                    websocket_transport_factory = WampWebSocketServerFactory(self._router_session_factory, self.config.extra.cbdir, websocket_config, self._templates)
+                    websocket_transport_factory.noisy = False
+                    websocket_factory_map[websocket_url_first_component] = websocket_transport_factory
+                    self.log.debug('hooked up websocket factory on request URI {request_uri}', request_uri=websocket_url_first_component)
+            else:
+                websocket_factory_map = None
 
-            # Web access logging
-            #
-            if not options.get('access_log', False):
-                transport_factory.log = lambda _: None
-
-            # Traceback rendering
-            #
-            transport_factory.displayTracebacks = options.get('display_tracebacks', False)
-
-            # HSTS
-            #
-            if options.get('hsts', False):
-                if 'tls' in config['endpoint']:
-                    hsts_max_age = int(options.get('hsts_max_age', 31536000))
-                    transport_factory.requestFactory = createHSTSRequestFactory(transport_factory.requestFactory, hsts_max_age)
-                else:
-                    self.log.warn("Warning: HSTS requested, but running on non-TLS - skipping HSTS")
+            transport_factory = UniSocketServerFactory(web_factory, websocket_factory_map, rawsocket_factory)
 
         # Unknown transport type
         #
@@ -797,6 +869,41 @@ class RouterWorkerSession(NativeWorkerSession):
 
         d.addCallbacks(ok, fail)
         return d
+
+    def _create_web_factory(self, config):
+
+        options = config.get('options', {})
+
+        # create Twisted Web root resource
+        if '/' in config['paths']:
+            root_config = config['paths']['/']
+            root = self._create_resource(root_config, nested=False)
+        else:
+            root = Resource404(self._templates, b'')
+
+        # create Twisted Web resources on all non-root paths configured
+        self._add_paths(root, config.get('paths', {}))
+
+        # create the actual transport factory
+        transport_factory = Site(root)
+        transport_factory.noisy = False
+
+        # Web access logging
+        if not options.get('access_log', False):
+            transport_factory.log = lambda _: None
+
+        # Traceback rendering
+        transport_factory.displayTracebacks = options.get('display_tracebacks', False)
+
+        # HSTS
+        if options.get('hsts', False):
+            if 'tls' in config['endpoint']:
+                hsts_max_age = int(options.get('hsts_max_age', 31536000))
+                transport_factory.requestFactory = createHSTSRequestFactory(transport_factory.requestFactory, hsts_max_age)
+            else:
+                self.log.warn("Warning: HSTS requested, but running on non-TLS - skipping HSTS")
+
+        return transport_factory
 
     def _add_paths(self, resource, paths):
         """
@@ -946,6 +1053,14 @@ class RouterWorkerSession(NativeWorkerSession):
             redirect_url = path_config['url'].encode('ascii', 'ignore')
             return RedirectResource(redirect_url)
 
+        # Reverse proxy resource
+        #
+        elif path_config['type'] == 'reverseproxy':
+            host = path_config['host']
+            port = int(path_config.get('port', 80))
+            path = path_config.get('path', '').encode('ascii', 'ignore')
+            return ReverseProxyResource(host, port, path)
+
         # JSON value resource
         #
         elif path_config['type'] == 'json':
@@ -974,7 +1089,6 @@ class RouterWorkerSession(NativeWorkerSession):
                                                killAfter=path_options.get('session_timeout', 30),
                                                queueLimitBytes=path_options.get('queue_limit_bytes', 128 * 1024),
                                                queueLimitMessages=path_options.get('queue_limit_messages', 100),
-                                               debug=path_options.get('debug', False),
                                                debug_transport_id=path_options.get('debug_transport_id', None)
                                                )
             lp_resource._templates = self._templates

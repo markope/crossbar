@@ -41,14 +41,12 @@ import shutil
 from twisted.internet.error import ReactorNotRunning
 from twisted.internet.defer import Deferred, DeferredList, inlineCallbacks, returnValue
 from twisted.internet.error import ProcessExitedAlready
-from twisted.internet.threads import deferToThread
 from twisted.python.runtime import platform
 
 from autobahn.util import utcnow, utcstr
 from autobahn.wamp.exception import ApplicationError
 from autobahn.wamp.types import PublishOptions, RegisterOptions
 
-import crossbar
 from crossbar.common import checkconfig
 from crossbar.twisted.processutil import WorkerProcessEndpoint
 from crossbar.controller.native import create_native_worker_client_factory
@@ -58,8 +56,9 @@ from crossbar.controller.processtypes import RouterWorkerProcess, \
     GuestWorkerProcess, \
     WebSocketTesteeWorkerProcess
 from crossbar.common.process import NativeProcessSession
-from crossbar.platform import HAS_FSNOTIFY, DirWatcher
-from crossbar._logging import make_logger, _loglevel
+from crossbar.common.fswatcher import HAS_FS_WATCHER, FilesystemWatcher
+
+from txaio import make_logger, get_global_log_level
 
 
 __all__ = ('NodeControllerSession', 'create_process_env')
@@ -90,10 +89,11 @@ class NodeControllerSession(NativeProcessSession):
 
         # associated node
         self._node = node
-        self._node_id = node._node_id
         self._realm = node._realm
 
         self.cbdir = self._node._cbdir
+
+        self._uri_prefix = u'crossbar'
 
         self._started = None
         self._pid = os.getpid()
@@ -107,9 +107,6 @@ class NodeControllerSession(NativeProcessSession):
 
         self.log.debug("Connected to node management router")
 
-        # self._uri_prefix = u'crossbar.node.{}'.format(self.config.extra.node)
-        self._uri_prefix = u'crossbar.node.{}'.format(self._node_id)
-
         NativeProcessSession.onConnect(self, False)
 
         # self.join(self.config.realm)
@@ -117,6 +114,8 @@ class NodeControllerSession(NativeProcessSession):
 
     @inlineCallbacks
     def onJoin(self, details):
+
+        from autobahn.wamp.types import SubscribeOptions
 
         self.log.info("Joined realm '{realm}' on node management router", realm=details.realm)
 
@@ -139,7 +138,7 @@ class NodeControllerSession(NativeProcessSession):
                 self.log.error("Internal error: on_worker_ready() fired for process {process}, but no process with that ID",
                                process=id)
 
-        self.subscribe(on_worker_ready, 'crossbar.node.{}.on_worker_ready'.format(self._node_id))
+        self.subscribe(on_worker_ready, u'crossbar.worker..on_worker_ready', SubscribeOptions(match=u'wildcard'))
 
         yield NativeProcessSession.onJoin(self, details)
 
@@ -150,6 +149,8 @@ class NodeControllerSession(NativeProcessSession):
             'shutdown',
 
             'get_workers',
+
+            'get_worker',
             'get_worker_log',
 
             'start_router',
@@ -177,7 +178,7 @@ class NodeControllerSession(NativeProcessSession):
 
         self._started = utcnow()
 
-        self.publish(u"crossbar.node.on_ready", self._node_id)
+        self.publish(u"crossbar.on_ready")
 
         self.log.debug("Node controller ready")
 
@@ -189,11 +190,11 @@ class NodeControllerSession(NativeProcessSession):
         :rtype: dict
         """
         return {
-            'started': self._started,
-            'pid': self._pid,
-            'workers': len(self._workers),
-            'directory': self.cbdir,
-            'wamplets': self._get_wamplets()
+            u'started': self._started,
+            u'pid': self._pid,
+            u'workers': len(self._workers),
+            u'directory': self.cbdir,
+            u'wamplets': self._get_wamplets()
         }
 
     @inlineCallbacks
@@ -211,15 +212,15 @@ class NodeControllerSession(NativeProcessSession):
 
         # publish management API event
         shutdown_info = {
-            'restart': restart,
-            'mode': mode,
-            'who': details.caller if details else None,
-            'when': utcnow()
+            u'restart': restart,
+            u'mode': mode,
+            u'who': details.caller if details else None,
+            u'when': utcnow()
         }
         yield self.publish(
-            'crossbar.node.{}.on_shutdown'.format(self._node_id),
+            u'{}.on_shutdown'.format(self._uri_prefix),
             shutdown_info,
-            options=PublishOptions(exclude=[details.caller] if details else None, acknowledge=True)
+            options=PublishOptions(exclude=details.caller if details else None, acknowledge=True)
         )
 
         def stop_reactor():
@@ -244,20 +245,21 @@ class NodeControllerSession(NativeProcessSession):
             except Exception as e:
                 pass
             else:
-                ep = {}
-                ep['dist'] = entrypoint.dist.key
-                ep['version'] = entrypoint.dist.version
-                ep['location'] = entrypoint.dist.location
-                ep['name'] = entrypoint.name
-                ep['module_name'] = entrypoint.module_name
-                ep['entry_point'] = str(entrypoint)
+                ep = {
+                    u'dist': entrypoint.dist.key,
+                    u'version': entrypoint.dist.version,
+                    u'location': entrypoint.dist.location,
+                    u'name': entrypoint.name,
+                    u'module_name': entrypoint.module_name,
+                    u'entry_point': str(entrypoint),
+                }
 
                 if hasattr(e, '__doc__') and e.__doc__:
-                    ep['doc'] = e.__doc__.strip()
+                    ep[u'doc'] = e.__doc__.strip()
                 else:
-                    ep['doc'] = None
+                    ep[u'doc'] = None
 
-                ep['meta'] = e(None)
+                ep[u'meta'] = e(None)
 
                 res.append(ep)
 
@@ -273,19 +275,42 @@ class NodeControllerSession(NativeProcessSession):
         now = datetime.utcnow()
         res = []
         for worker in sorted(self._workers.values(), key=lambda w: w.created):
-            res.append({
-                'id': worker.id,
-                'pid': worker.pid,
-                'type': worker.TYPE,
-                'status': worker.status,
-                'created': utcstr(worker.created),
-                'started': utcstr(worker.started),
-                'startup_time': (worker.started - worker.created).total_seconds() if worker.started else None,
-                'uptime': (now - worker.started).total_seconds() if worker.started else None,
-            })
+            res.append(
+                {
+                    u'id': worker.id,
+                    u'pid': worker.pid,
+                    u'type': worker.TYPE,
+                    u'status': worker.status,
+                    u'created': utcstr(worker.created),
+                    u'started': utcstr(worker.started),
+                    u'startup_time': (worker.started - worker.created).total_seconds() if worker.started else None,
+                    u'uptime': (now - worker.started).total_seconds() if worker.started else None,
+                }
+            )
         return res
 
-    def get_worker_log(self, id, limit=None, details=None):
+    def get_worker(self, id, details=None):
+        if id not in self._workers:
+            emsg = "No worker with ID '{}'".format(id)
+            raise ApplicationError(u'crossbar.error.no_such_worker', emsg)
+
+        now = datetime.utcnow()
+        worker = self._workers[id]
+
+        worker_info = {
+            u'id': worker.id,
+            u'pid': worker.pid,
+            u'type': worker.TYPE,
+            u'status': worker.status,
+            u'created': utcstr(worker.created),
+            u'started': utcstr(worker.started),
+            u'startup_time': (worker.started - worker.created).total_seconds() if worker.started else None,
+            u'uptime': (now - worker.started).total_seconds() if worker.started else None,
+        }
+
+        return worker_info
+
+    def get_worker_log(self, id, limit=100, details=None):
         """
         Get buffered log for a worker.
 
@@ -396,19 +421,19 @@ class NodeControllerSession(NativeProcessSession):
         else:
             exe = sys.executable
 
-        # all native workers (routers and containers for now) start from the same script
-        #
-        filename = os.path.abspath(os.path.join(crossbar.__file__, "..", "worker", "process.py"))
-
         # assemble command line for forking the worker
         #
-        args = [exe, "-u", filename]
+        # all native workers (routers and containers for now) start
+        # from the same script in crossbar/worker/process.py -- we're
+        # invoking via "-m" so that .pyc files, __pycache__ etc work
+        # properly.
+
+        args = [exe, "-u", "-m", "crossbar.worker.process"]
         args.extend(["--cbdir", self._node._cbdir])
-        args.extend(["--node", str(self._node_id)])
         args.extend(["--worker", str(id)])
         args.extend(["--realm", self._realm])
         args.extend(["--type", wtype])
-        args.extend(["--loglevel", _loglevel])
+        args.extend(["--loglevel", get_global_log_level()])
 
         # allow override worker process title from options
         #
@@ -443,14 +468,14 @@ class NodeControllerSession(NativeProcessSession):
         # topic URIs used (later)
         #
         if wtype == 'router':
-            starting_topic = 'crossbar.node.{}.on_router_starting'.format(self._node_id)
-            started_topic = 'crossbar.node.{}.on_router_started'.format(self._node_id)
+            starting_topic = 'crossbar.node.on_router_starting'
+            started_topic = 'crossbar.node.on_router_started'
         elif wtype == 'container':
-            starting_topic = 'crossbar.node.{}.on_container_starting'.format(self._node_id)
-            started_topic = 'crossbar.node.{}.on_container_started'.format(self._node_id)
+            starting_topic = 'crossbar.node.on_container_starting'
+            started_topic = 'crossbar.node.on_container_started'
         elif wtype == 'websocket-testee':
-            starting_topic = 'crossbar.node.{}.on_websocket_testee_starting'.format(self._node_id)
-            started_topic = 'crossbar.node.{}.on_websocket_testee_started'.format(self._node_id)
+            starting_topic = 'crossbar.node.on_websocket_testee_starting'
+            started_topic = 'crossbar.node.on_websocket_testee_started'
         else:
             raise Exception("logic error")
 
@@ -502,16 +527,16 @@ class NodeControllerSession(NativeProcessSession):
             worker.started = datetime.utcnow()
 
             started_info = {
-                'id': worker.id,
-                'status': worker.status,
-                'started': utcstr(worker.started),
-                'who': worker.who
+                u'id': worker.id,
+                u'status': worker.status,
+                u'started': utcstr(worker.started),
+                u'who': worker.who,
             }
 
             # FIXME: make start of stats printer dependent on log level ..
             worker.log_stats(5.)
 
-            self.publish(started_topic, started_info, options=PublishOptions(exclude=[details.caller]))
+            self.publish(started_topic, started_info, options=PublishOptions(exclude=details.caller))
 
             return started_info
 
@@ -580,10 +605,10 @@ class NodeControllerSession(NativeProcessSession):
         # now (immediately before actually forking) signal the starting of the worker
         #
         starting_info = {
-            'id': id,
-            'status': worker.status,
-            'created': utcstr(worker.created),
-            'who': worker.who
+            u'id': id,
+            u'status': worker.status,
+            u'created': utcstr(worker.created),
+            u'who': worker.who,
         }
 
         # the caller gets a progressive result ..
@@ -591,7 +616,7 @@ class NodeControllerSession(NativeProcessSession):
             details.progress(starting_info)
 
         # .. while all others get an event
-        self.publish(starting_topic, starting_info, options=PublishOptions(exclude=[details.caller]))
+        self.publish(starting_topic, starting_info, options=PublishOptions(exclude=details.caller))
 
         # now actually fork the worker ..
         #
@@ -742,19 +767,19 @@ class NodeControllerSession(NativeProcessSession):
             raise ApplicationError(u'crossbar.error.worker_not_running', emsg)
 
         stop_info = {
-            'id': worker.id,
-            'type': wtype,
-            'kill': kill,
-            'who': details.caller if details else None,
-            'when': utcnow()
+            u'id': worker.id,
+            u'type': wtype,
+            u'kill': kill,
+            u'who': details.caller if details else None,
+            u'when': utcnow(),
         }
 
         # publish management API event
         #
         yield self.publish(
-            'crossbar.node.{}.worker.{}.on_stop_requested'.format(self._node_id, worker.id),
+            u'{}.on_stop_requested'.format(self._uri_prefix),
             stop_info,
-            options=PublishOptions(exclude=[details.caller] if details else None, acknowledge=True)
+            options=PublishOptions(exclude=details.caller if details else None, acknowledge=True)
         )
 
         # send SIGKILL or SIGTERM to worker
@@ -838,8 +863,8 @@ class NodeControllerSession(NativeProcessSession):
 
         # topic URIs used (later)
         #
-        starting_topic = 'crossbar.node.{}.on_guest_starting'.format(self._node_id)
-        started_topic = 'crossbar.node.{}.on_guest_started'.format(self._node_id)
+        starting_topic = u'{}.on_guest_starting'.format(self._uri_prefix)
+        started_topic = u'{}.on_guest_started'.format(self._uri_prefix)
 
         # add worker tracking instance to the worker map ..
         #
@@ -871,7 +896,7 @@ class NodeControllerSession(NativeProcessSession):
             #
             if 'watch' in options:
 
-                if HAS_FSNOTIFY:
+                if HAS_FS_WATCHER:
 
                     # assemble list of watched directories
                     watched_dirs = []
@@ -880,44 +905,47 @@ class NodeControllerSession(NativeProcessSession):
 
                     worker.watch_timeout = options['watch'].get('timeout', 1)
 
-                    # create a directory watcher
-                    worker.watcher = DirWatcher(dirs=watched_dirs, notify_once=True)
+                    # create a filesystem watcher
+                    worker.watcher = FilesystemWatcher(workdir, watched_dirs=watched_dirs)
 
-                    # make sure to stop the background thread running inside the
-                    # watcher upon Twisted being shut down
+                    # make sure to stop the watch upon Twisted being shut down
                     def on_shutdown():
                         worker.watcher.stop()
 
                     self._node._reactor.addSystemEventTrigger('before', 'shutdown', on_shutdown)
 
                     # this handler will get fired by the watcher upon detecting an FS event
-                    def on_fsevent(evt):
+                    def on_filesystem_change(fs_event):
                         worker.watcher.stop()
                         proto.signal('TERM')
 
                         if options['watch'].get('action', None) == 'restart':
-                            self.log.info("Restarting guest ..")
+                            self.log.info("Filesystem watcher detected change {fs_event} - restarting guest in {watch_timeout} seconds ..", fs_event=fs_event, watch_timeout=worker.watch_timeout)
                             # Add a timeout large enough (perhaps add a config option later)
                             self._node._reactor.callLater(worker.watch_timeout, self.start_guest, id, config, details)
                             # Shut the worker down, after the restart event is scheduled
-                            worker.stop()
+                            # FIXME: all workers should have a stop() method ..
+                            # -> 'GuestWorkerProcess' object has no attribute 'stop'
+                            # worker.stop()
+                        else:
+                            self.log.info("Filesystem watcher detected change {fs_event} - no action taken!", fs_event=fs_event)
 
-                    # now run the watcher on a background thread
-                    deferToThread(worker.watcher.loop, on_fsevent)
+                    # now start watching ..
+                    worker.watcher.start(on_filesystem_change)
 
                 else:
-                    self.log.warn("Warning: cannot watch directory for changes - feature DirWatcher unavailable")
+                    self.log.warn("Cannot watch directories for changes - feature not available")
 
             # assemble guest worker startup information
             #
             started_info = {
-                'id': worker.id,
-                'status': worker.status,
-                'started': utcstr(worker.started),
-                'who': worker.who
+                u'id': worker.id,
+                u'status': worker.status,
+                u'started': utcstr(worker.started),
+                u'who': worker.who,
             }
 
-            self.publish(started_topic, started_info, options=PublishOptions(exclude=[details.caller]))
+            self.publish(started_topic, started_info, options=PublishOptions(exclude=details.caller))
 
             return started_info
 
@@ -950,10 +978,10 @@ class NodeControllerSession(NativeProcessSession):
         # now (immediately before actually forking) signal the starting of the worker
         #
         starting_info = {
-            'id': id,
-            'status': worker.status,
-            'created': utcstr(worker.created),
-            'who': worker.who
+            u'id': id,
+            u'status': worker.status,
+            u'created': utcstr(worker.created),
+            u'who': worker.who,
         }
 
         # the caller gets a progressive result ..
@@ -961,7 +989,7 @@ class NodeControllerSession(NativeProcessSession):
             details.progress(starting_info)
 
         # .. while all others get an event
-        self.publish(starting_topic, starting_info, options=PublishOptions(exclude=[details.caller]))
+        self.publish(starting_topic, starting_info, options=PublishOptions(exclude=details.caller))
 
         # now actually fork the worker ..
         #
@@ -996,7 +1024,9 @@ class NodeControllerSession(NativeProcessSession):
         def on_connect_error(err):
 
             # not sure when this errback is triggered at all .. see above.
-            self.log.error("Internal error: connection to forked guest worker failed ({})".format(err))
+            self.log.failure(
+                "Internal error: connection to forked guest worker failed ({log_failure.value})",
+            )
 
             # in any case, forward the error ..
             worker.ready.errback(err)
@@ -1037,6 +1067,12 @@ def create_process_env(options):
     """
     penv = {}
 
+    # Usually, we want PYTHONUNBUFFERED set in child processes, *but*
+    # if the user explicitly configures their environment we don't
+    # stomp over it. So, a user wanting *buffered* output can set
+    # PYTHONUNBUFFERED to the empty string in their config.
+    saw_unbuff = False
+
     # by default, a worker/guest process inherits
     # complete environment
     inherit_all = True
@@ -1051,15 +1087,25 @@ def create_process_env(options):
             for v in inherit:
                 if v in os.environ:
                     penv[v] = os.environ[v]
+                    if v == 'PYTHONUNBUFFERED':
+                        saw_unbuff = True
 
     if inherit_all:
         # must do deepcopy like this (os.environ is a "special" thing ..)
         for k, v in os.environ.items():
             penv[k] = v
+            if k == 'PYTHONUNBUFFERED':
+                saw_unbuff = True
 
     # explicit environment vars from config
     if 'env' in options and 'vars' in options['env']:
         for k, v in options['env']['vars'].items():
             penv[k] = v
+            if k == 'PYTHONUNBUFFERED':
+                saw_unbuff = True
 
+    # if nothing so far has set PYTHONUNBUFFERED explicitly, we set it
+    # ourselves.
+    if not saw_unbuff:
+        penv['PYTHONUNBUFFERED'] = '1'
     return penv
