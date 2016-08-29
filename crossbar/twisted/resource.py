@@ -335,6 +335,8 @@ class FileUploadResource(Resource):
                     for cn in range(1, totalChunks + 1):
                         with open(os.path.join(fileTempDir, 'chunk_' + str(cn)), 'rb') as ff:
                             _finalFile.write(ff.read())
+                            ff.close()
+                    _finalFile.close()
 
                 os.rename(_finalFileName, finalFileName)
 
@@ -393,6 +395,7 @@ class FileUploadResource(Resource):
 
                 with open(_finalFileName, 'wb') as _finalFile:
                     _finalFile.write(fileContent)
+                    _finalFile.close()
 
                 if self._file_permissions:
                     perm = int(self._file_permissions, 8)
@@ -435,6 +438,8 @@ class FileUploadResource(Resource):
 
                 with open(_chunkName, 'wb') as chunk:
                     chunk.write(fileContent)
+                    chunk.close()
+
                 os.rename(_chunkName, chunkName)  # atomic file system operation
                 self.log.debug('chunk_' + str(chunkNumber) + ' written and moved to ' + chunkName)
                 # publish file upload progress
@@ -462,6 +467,8 @@ class FileUploadResource(Resource):
 
             with open(_chunkName, 'wb') as chunk:
                 chunk.write(fileContent)
+                chunk.close()
+                
             os.rename(_chunkName, chunkName)
             self.log.debug('chunk_' + str(chunkNumber) + ' written and moved to ' + chunkName)
 
